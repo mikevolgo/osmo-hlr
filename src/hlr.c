@@ -809,6 +809,11 @@ int main(int argc, char **argv)
 		return rc;
 	}
 
+	if (cmdline_opts.db_check) {
+		/* Make sure to use synchronous logging to stderr in --db-check (non-interactive mode): */
+		log_target_file_switch_to_stream(osmo_stderr_target);
+	}
+
 	LOGP(DMAIN, LOGL_NOTICE, "hlr starting\n");
 
 	rc = rand_init();
