@@ -47,6 +47,58 @@
 #include <osmocom/hlr/logging.h>
 
 static struct osmo_gsup_client *g_gc;
+#define MAX_SESSIONS 100
+
+struct ussd_session {
+    char imsi[32];
+    uint32_t session_id;
+    int step;
+};
+
+static struct ussd_session sessions[MAX_SESSIONS];
+static int registered = 0;
+
+static struct ussd_session *get_session(const char *imsi, uint32_t session_id)
+{
+    int i;
+    for (i = 0; i < MAX_SESSIONS; i++) {
+        if (!strcmp(sessions[i].imsi, imsi) &&
+            sessions[i].session_id == session_id)
+            return &sessions[i];
+    }
+    for (i = 0; i < MAX_SESSIONS; i++) {
+        if (sessions[i].imsi[0] == '\0') {
+            strcpy(sessions[i].imsi, imsi);
+            sessions[i].session_id = session_id;
+            sessions[i].step = 0;
+            return &sessions[i];
+        }
+    }
+    return NULL;
+}
+
+static void fake_register(void)
+{
+    struct osmo_gsup_message msg = {0};
+    struct msgb *msgb;
+
+    msg.message_type = OSMO_GSUP_MSGT_UPDATE_LOCATION_REQUEST;
+
+    /* любой IMSI (можно тестовый) */
+    OSMO_STRLCPY_ARRAY(msg.imsi, "001010000000001");
+
+    msgb = gsm0480_msgb_alloc_name("GSUP register");
+    osmo_gsup_encode(msgb, &msg);
+
+    printf("Sending fake REGISTER to create route\n");
+
+    osmo_gsup_client_send(g_gc, msgb);
+}
+
+static void clear_session(struct ussd_session *s)
+{
+    memset(s, 0, sizeof(*s));
+}
 
 /*! send a SS/USSD response to a given imsi/session.
  *  \param[in] gsupc GSUP client connection through which to send
@@ -131,6 +183,21 @@ static int euse_tx_ussd_resp_7bit(struct osmo_gsup_client *gsupc, const char *im
 	return euse_tx_ss(gsupc, imsi, session_id, OSMO_GSUP_MSGT_PROC_SS_RESULT, final, ss_msg);
 }
 
+// static int euse_tx_ussd_resp_ucs2(struct osmo_gsup_client *gsupc,
+// 	const char *imsi, uint32_t session_id,
+// 	bool final, uint8_t invoke_id, const char *text)
+// {
+// 	struct msgb *msg;
+
+// 	msg = gsm0480_create_ussd_resp(invoke_id, 0x0F, text);
+// 	/* 0x0F = UCS2 */
+
+// 	OSMO_ASSERT(msg);
+
+// 	return euse_tx_ss(gsupc, imsi, session_id,
+// 		OSMO_GSUP_MSGT_PROC_SS_RESULT, final, msg);
+// }
+
 static int euse_rx_proc_ss_req(struct osmo_gsup_client *gsupc, const struct osmo_gsup_message *gsup)
 {
 	char buf[GSM0480_USSD_7BIT_STRING_LEN+1];
@@ -148,21 +215,110 @@ static int euse_rx_proc_ss_req(struct osmo_gsup_client *gsupc, const struct osmo
 		gsup->session_id, osmo_gsup_session_state_name(gsup->session_state),
 		gsm0480_op_code_name(req.opcode), req.ussd_text);
 
-	/* we only handle single-request-response USSD in this demo */
-	if (gsup->session_state != OSMO_GSUP_SESSION_STATE_BEGIN) {
-		return euse_tx_ussd_reject(gsupc, gsup->imsi, gsup->session_id, req.invoke_id,
-					   GSM_0480_PROBLEM_CODE_TAG_GENERAL,
-					   GSM_0480_GEN_PROB_CODE_UNRECOGNISED);
-	}
+	// /* we only handle single-request-response USSD in this demo */
+	// if (gsup->session_state != OSMO_GSUP_SESSION_STATE_BEGIN) {
+	// 	return euse_tx_ussd_reject(gsupc, gsup->imsi, gsup->session_id, req.invoke_id,
+	// 				   GSM_0480_PROBLEM_CODE_TAG_GENERAL,
+	// 				   GSM_0480_GEN_PROB_CODE_UNRECOGNISED);
+	// }
 
-	snprintf(buf, sizeof(buf), "You sent \"%s\"", req.ussd_text);
-	return euse_tx_ussd_resp_7bit(gsupc, gsup->imsi, gsup->session_id, true, req.invoke_id, buf);
+	// snprintf(buf, sizeof(buf), "You sent \"%s\"", req.ussd_text);
+	// return euse_tx_ussd_resp_7bit(gsupc, gsup->imsi, gsup->session_id, true, req.invoke_id, buf);
+	struct ussd_session *sess;
+	const char *in = req.ussd_text;
+
+	sess = get_session(gsup->imsi, gsup->session_id);
+	if (!sess)
+		return euse_tx_ussd_resp_7bit(gsupc, gsup->imsi, gsup->session_id,
+									true, req.invoke_id, "System error");
+
+	switch (sess->step) {
+
+	case 0:
+		euse_tx_ussd_resp_7bit(gsupc, gsup->imsi, gsup->session_id,
+			false, req.invoke_id,
+			"Welcome\n1. Balance\n2. Services");
+		sess->step = 1;
+		break;
+
+	case 1:
+		if (!strcmp(in, "1")) {
+			euse_tx_ussd_resp_7bit(gsupc, gsup->imsi, gsup->session_id,
+				true, req.invoke_id,
+				"Balance: 5.23 USD");
+			clear_session(sess);
+
+		} else if (!strcmp(in, "2")) {
+			euse_tx_ussd_resp_7bit(gsupc, gsup->imsi, gsup->session_id,
+				false, req.invoke_id,
+				"Services:\n1. Enable\n2. Disable");
+			sess->step = 2;
+
+		} else {
+			euse_tx_ussd_resp_7bit(gsupc, gsup->imsi, gsup->session_id,
+				true, req.invoke_id,
+				"Invalid option");
+			clear_session(sess);
+		}
+		break;
+
+	case 2:
+		if (!strcmp(in, "1")) {
+			euse_tx_ussd_resp_7bit(gsupc, gsup->imsi, gsup->session_id,
+				true, req.invoke_id,
+				"Service enabled");
+		} else {
+			euse_tx_ussd_resp_7bit(gsupc, gsup->imsi, gsup->session_id,
+				true, req.invoke_id,
+				"Service disabled");
+		}
+		clear_session(sess);
+		break;
+
+	default:
+		euse_tx_ussd_resp_7bit(gsupc, gsup->imsi, gsup->session_id,
+			true, req.invoke_id,
+			"Error");
+		clear_session(sess);
+		break;
+	}
 }
+
+// static int send_ussd_push(const char *imsi, const char *text)
+// {
+// 	struct osmo_gsup_message gsup = {0};
+// 	struct msgb *msg;
+
+// 	uint8_t invoke_id = 1;
+
+// 	OSMO_STRLCPY_ARRAY(gsup.imsi, imsi);
+// 	gsup.message_type = OSMO_GSUP_MSGT_PROC_SS_REQUEST;
+// 	gsup.session_state = OSMO_GSUP_SESSION_STATE_BEGIN;
+// 	gsup.session_id = rand();
+
+// 	msg = gsm0480_gen_ussd_notify_7bit(invoke_id, text);
+// 	OSMO_ASSERT(msg);
+
+// 	gsup.ss_info = msgb_data(msg);
+// 	gsup.ss_info_len = msgb_length(msg);
+
+// 	struct msgb *out = gsm0480_msgb_alloc_name("ussd_push");
+// 	osmo_gsup_encode(out, &gsup);
+
+// 	LOGP(DMAIN, LOGL_NOTICE, "Sending MT USSD to %s: %s\n", imsi, text);
+
+// 	return osmo_gsup_client_send(g_gc, out);
+// }
 
 static int gsupc_read_cb(struct osmo_gsup_client *gsupc, struct msgb *msg)
 {
 	struct osmo_gsup_message gsup_msg = {0};
 	int rc;
+
+	if (!registered) {
+		fake_register();
+		registered = 1;
+	}
 
 	rc = osmo_gsup_decode(msgb_l2(msg), msgb_l2len(msg), &gsup_msg);
 	if (rc < 0) {
@@ -228,7 +384,7 @@ int main(int argc, char **argv)
 	if (argc > 2)
 		server_port = atoi(argv[2]);
 
-	g_gc = osmo_gsup_client_create(ctx, "EUSE-foobar", server_host, server_port, gsupc_read_cb, NULL);
+	g_gc = osmo_gsup_client_create(ctx, "EUSE-foobar-00-00-00-00-00-00", server_host, server_port, gsupc_read_cb, NULL);
 
 	while (1) {
 		osmo_select_main(0);
